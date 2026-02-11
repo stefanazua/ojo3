@@ -1,9 +1,9 @@
 fastapi
 uvicorn
-yfinance
+gunicorn
 pandas
 numpy
+yfinance
 reportlab
-python-multipart
-gunicorn
-
+requests
+python-dateutil
