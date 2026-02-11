@@ -1,229 +1,378 @@
 from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse, FileResponse
-import yfinance as yf
+from fastapi.responses import Response, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+import io
+from datetime import datetime, timezone
+
 import pandas as pd
 import numpy as np
-from datetime import datetime, timezone
+import yfinance as yf
+
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
-import os
+from reportlab.lib.units import cm
 
+
+# ============================================================
+# APP FASTAPI
+# ============================================================
 app = FastAPI(title="IA Trading Pullback API", version="1.0")
 
+# CORS (para Google Apps Script, Hostgator, etc.)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # para pruebas (luego puedes restringir)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# =========================================================
-# UTILIDADES
-# =========================================================
+
+# ============================================================
+# HELPERS
+# ============================================================
 def now_utc_str():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def safe_round(x, dec=2):
-    if x is None:
-        return None
+def safe_float(x, default=None):
     try:
-        return round(float(x), dec)
+        return float(x)
     except:
-        return None
+        return default
+
+
+def download_data(ticker: str):
+    """
+    Descarga datos 1H y 4H del último mes.
+    yfinance a veces limita 4H, entonces se reconstruye 4H desde 1H.
+    """
+    ticker = ticker.strip().upper()
+
+    # 1H directo
+    df_1h = yf.download(
+        ticker,
+        period="1mo",
+        interval="1h",
+        auto_adjust=True,
+        progress=False,
+        threads=False,
+    )
+
+    if df_1h is None or df_1h.empty:
+        raise ValueError(f"No se pudo descargar datos 1H para {ticker}")
+
+    df_1h = df_1h.reset_index()
+    df_1h.rename(columns={"Datetime": "Date"}, inplace=True)
+    if "Date" not in df_1h.columns:
+        # fallback por si yfinance entrega otra columna
+        df_1h.rename(columns={df_1h.columns[0]: "Date"}, inplace=True)
+
+    df_1h["Date"] = pd.to_datetime(df_1h["Date"])
+    df_1h = df_1h.sort_values("Date").dropna()
+
+    # Construcción 4H desde 1H
+    df_1h_indexed = df_1h.set_index("Date")
+
+    df_4h = df_1h_indexed.resample("4H").agg(
+        {
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Close": "last",
+            "Volume": "sum",
+        }
+    ).dropna().reset_index()
+
+    return df_1h, df_4h
+
+
+def ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
 
 
 def rsi(series, period=14):
     delta = series.diff()
-    gain = delta.where(delta > 0, 0).rolling(period).mean()
+    gain = (delta.where(delta > 0, 0)).rolling(period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
     rs = gain / (loss + 1e-9)
     return 100 - (100 / (1 + rs))
-
-
-def ema(series, span):
-    return series.ewm(span=span, adjust=False).mean()
 
 
 def atr(df, period=14):
     high = df["High"]
     low = df["Low"]
     close = df["Close"]
-    tr = pd.concat([
-        (high - low),
-        (high - close.shift()).abs(),
-        (low - close.shift()).abs()
-    ], axis=1).max(axis=1)
+
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            (high - low),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
     return tr.rolling(period).mean()
 
 
-# =========================================================
-# DESCARGA DATOS (1H + 4H, 1 mes)
-# =========================================================
-def fetch_data(ticker: str):
-    # 1H (últimos 30 días)
-    df_1h = yf.download(ticker, period="1mo", interval="1h", progress=False)
-    if df_1h is None or df_1h.empty:
-        return None, None
+def detect_pullback_plan(df_4h: pd.DataFrame, df_1h: pd.DataFrame):
+    """
+    Estrategia swing pullback:
+    - Tendencia en 4H por EMA20 vs EMA50
+    - Pullback: precio cerca EMA20 y RSI recuperándose
+    - Entrada: ruptura del máximo 1H reciente (gatillo)
+    - SL: bajo swing low + ATR
+    - TP: R:R 1.5 y 2.5 aprox + resistencia reciente
+    """
 
-    df_1h = df_1h.dropna().copy()
+    # ---------------------------
+    # Indicadores 4H
+    # ---------------------------
+    df4 = df_4h.copy()
+    df4["EMA20"] = ema(df4["Close"], 20)
+    df4["EMA50"] = ema(df4["Close"], 50)
+    df4["RSI14"] = rsi(df4["Close"], 14)
 
-    # 4H se construye resampleando 1H
-    df_4h = df_1h.resample("4H").agg({
-        "Open": "first",
-        "High": "max",
-        "Low": "min",
-        "Close": "last",
-        "Volume": "sum"
-    }).dropna()
+    # ---------------------------
+    # Indicadores 1H
+    # ---------------------------
+    df1 = df_1h.copy()
+    df1["EMA20"] = ema(df1["Close"], 20)
+    df1["EMA50"] = ema(df1["Close"], 50)
+    df1["RSI14"] = rsi(df1["Close"], 14)
+    df1["ATR14"] = atr(df1, 14)
 
-    return df_1h, df_4h
+    # Último precio
+    last_price = float(df1["Close"].iloc[-1])
+    last_time = df1["Date"].iloc[-1]
 
+    # ---------------------------
+    # Dirección por 4H
+    # ---------------------------
+    ema20 = df4["EMA20"].iloc[-1]
+    ema50 = df4["EMA50"].iloc[-1]
+    rsi4 = df4["RSI14"].iloc[-1]
 
-# =========================================================
-# LÓGICA PULLBACK SWING (PRO)
-# =========================================================
-def analyze_pullback(df_1h, df_4h):
-    close1 = df_1h["Close"]
-    close4 = df_4h["Close"]
-
-    # Indicadores
-    df_4h["EMA20"] = ema(close4, 20)
-    df_4h["EMA50"] = ema(close4, 50)
-    df_4h["RSI14"] = rsi(close4, 14)
-    df_4h["ATR14"] = atr(df_4h, 14)
-
-    df_1h["EMA20"] = ema(close1, 20)
-    df_1h["EMA50"] = ema(close1, 50)
-    df_1h["RSI14"] = rsi(close1, 14)
-
-    current_price = float(close1.iloc[-1])
-    atr_now = float(df_4h["ATR14"].iloc[-1]) if not np.isnan(df_4h["ATR14"].iloc[-1]) else current_price * 0.01
-
-    # Tendencia 4H
-    ema20_4h = df_4h["EMA20"].iloc[-1]
-    ema50_4h = df_4h["EMA50"].iloc[-1]
-
-    if ema20_4h > ema50_4h:
+    if ema20 > ema50:
         trend = "ALCISTA"
-        direction = "LONG (pullback)"
+        direction = "LONG"
     else:
         trend = "BAJISTA"
-        direction = "SHORT (pullback)"
+        direction = "SHORT"
 
-    # Pullback zone 1H
-    ema20_1h = df_1h["EMA20"].iloc[-1]
-    ema50_1h = df_1h["EMA50"].iloc[-1]
+    # ---------------------------
+    # Pullback zone (aprox)
+    # ---------------------------
+    # LONG: precio cerca EMA20 4H (pullback sano)
+    # SHORT: precio cerca EMA20 4H pero por debajo
+    last_4h_close = df4["Close"].iloc[-1]
+    pullback_distance = abs(last_4h_close - ema20) / (ema20 + 1e-9)
 
-    # Entrada: cerca EMA20/EMA50 según tendencia
-    if trend == "ALCISTA":
-        entry = min(ema20_1h, ema50_1h)
-        sl1 = entry - atr_now * 0.8
-        sl2 = entry - atr_now * 1.2
-        tp1 = entry + atr_now * 1.2
-        tp2 = entry + atr_now * 2.0
+    pullback_ok = pullback_distance < 0.02  # 2% del EMA20
+
+    # ---------------------------
+    # Gatillo 1H
+    # ---------------------------
+    recent = df1.tail(20)  # últimas 20 velas 1H (~1 día)
+    recent_high = float(recent["High"].max())
+    recent_low = float(recent["Low"].min())
+
+    # Swing low (para SL)
+    swing_low = float(df1.tail(60)["Low"].min())   # ~2.5 días
+    swing_high = float(df1.tail(60)["High"].max())
+
+    atr_now = float(df1["ATR14"].iloc[-1]) if not np.isnan(df1["ATR14"].iloc[-1]) else 0.0
+
+    # ---------------------------
+    # Definir entrada / SL / TP
+    # ---------------------------
+    if direction == "LONG":
+        entry = recent_high  # entrada por ruptura
+        sl1 = swing_low - (0.3 * atr_now)
+        sl2 = swing_low - (0.8 * atr_now)
+
+        risk = entry - sl1
+        tp1 = entry + (1.5 * risk)
+        tp2 = entry + (2.5 * risk)
+
+        # Ajuste: no dejar TP ridículo si el mercado está comprimido
+        tp1 = max(tp1, swing_high * 1.005)
+        tp2 = max(tp2, swing_high * 1.015)
+
     else:
-        entry = max(ema20_1h, ema50_1h)
-        sl1 = entry + atr_now * 0.8
-        sl2 = entry + atr_now * 1.2
-        tp1 = entry - atr_now * 1.2
-        tp2 = entry - atr_now * 2.0
+        entry = recent_low  # ruptura hacia abajo
+        sl1 = swing_high + (0.3 * atr_now)
+        sl2 = swing_high + (0.8 * atr_now)
 
-    # RR aproximado
-    risk = abs(entry - sl1)
-    reward = abs(tp1 - entry)
-    rr = reward / (risk + 1e-9)
+        risk = sl1 - entry
+        tp1 = entry - (1.5 * risk)
+        tp2 = entry - (2.5 * risk)
 
-    # Ajustes finales
-    result = {
-        "timestamp": now_utc_str(),
-        "precio_actual": safe_round(current_price, 4),
+        tp1 = min(tp1, swing_low * 0.995)
+        tp2 = min(tp2, swing_low * 0.985)
+
+    rr = abs((tp1 - entry) / (entry - sl1 + 1e-9))
+
+    # ---------------------------
+    # Texto final
+    # ---------------------------
+    nota = []
+    nota.append(f"Tendencia 4H: {trend} (EMA20 vs EMA50).")
+    nota.append(f"RSI 4H: {rsi4:.1f}.")
+    if pullback_ok:
+        nota.append("Pullback válido: precio cerca EMA20 4H.")
+    else:
+        nota.append("Pullback débil: precio lejos de EMA20 4H (precaución).")
+
+    nota.append("Entrada sugerida por ruptura 1H (gatillo swing).")
+    nota.append("SL basado en swing + ATR para evitar barridas.")
+
+    return {
+        "ticker": None,
+        "fecha_generacion": now_utc_str(),
+        "hora_sugerencia": str(last_time),
         "direccion": direction,
         "tendencia_4h": trend,
-        "entrada_sugerida": safe_round(entry, 4),
-        "sl1": safe_round(sl1, 4),
-        "sl2": safe_round(sl2, 4),
-        "tp1": safe_round(tp1, 4),
-        "tp2": safe_round(tp2, 4),
-        "rr_aprox_tp1": safe_round(rr, 2),
-        "nota": "Estrategia swing pullback: tendencia 4H (EMA20/EMA50) + zona de entrada 1H + ATR como distancia dinámica."
+        "precio_actual": round(last_price, 6),
+        "entrada": round(entry, 6),
+        "sl1": round(sl1, 6),
+        "sl2": round(sl2, 6),
+        "tp1": round(tp1, 6),
+        "tp2": round(tp2, 6),
+        "rr_aprox_tp1": round(rr, 2),
+        "nota": " ".join(nota),
     }
-    return result
 
 
-# =========================================================
-# PDF
-# =========================================================
-def create_pdf(data, ticker):
-    filename = f"resumen_{ticker}.pdf"
+def build_pdf(plan: dict) -> bytes:
+    """
+    PDF tipo tarjeta (bonito, simple, limpio).
+    """
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=letter)
 
-    c = canvas.Canvas(filename, pagesize=letter)
-    w, h = letter
-    y = h - 60
+    width, height = letter
 
+    # Fondo
     c.setFont("Helvetica-Bold", 16)
-    c.drawString(50, y, f"Resumen IA Trading (Pullback Swing)")
-    y -= 22
+    c.drawString(2 * cm, height - 2 * cm, "IA Trading Pullback (Swing)")
 
-    c.setFont("Helvetica", 11)
-    c.drawString(50, y, f"Ticker: {ticker}")
-    y -= 18
-    c.drawString(50, y, f"Generado: {data['timestamp']}")
-    y -= 26
+    c.setFont("Helvetica", 10)
+    c.drawString(2 * cm, height - 2.7 * cm, f"Generado: {plan['fecha_generacion']}")
 
+    # Caja tarjeta
+    x = 2 * cm
+    y = height - 15 * cm
+    w = width - 4 * cm
+    h = 11.5 * cm
+
+    c.roundRect(x, y, w, h, 12, stroke=1, fill=0)
+
+    # Contenido
     c.setFont("Helvetica-Bold", 12)
-    c.drawString(50, y, "Plan sugerido")
-    y -= 18
+    c.drawString(x + 0.7 * cm, y + h - 1.2 * cm, f"Ticker: {plan['ticker']}")
 
     c.setFont("Helvetica", 11)
-    lines = [
-        f"Dirección: {data['direccion']}",
-        f"Tendencia 4H: {data['tendencia_4h']}",
-        f"Precio actual: {data['precio_actual']}",
-        f"Entrada sugerida: {data['entrada_sugerida']}",
-        f"SL1: {data['sl1']}   |   SL2: {data['sl2']}",
-        f"TP1: {data['tp1']}   |   TP2: {data['tp2']}",
-        f"RR aprox (TP1): {data['rr_aprox_tp1']}",
-    ]
+    c.drawString(x + 0.7 * cm, y + h - 2.2 * cm, f"Dirección: {plan['direccion']}  |  Tendencia 4H: {plan['tendencia_4h']}")
 
-    for line in lines:
-        c.drawString(50, y, line)
-        y -= 18
+    c.setFont("Helvetica", 11)
+    c.drawString(x + 0.7 * cm, y + h - 3.2 * cm, f"Precio actual: {plan['precio_actual']}")
 
-    y -= 10
     c.setFont("Helvetica-Bold", 11)
-    c.drawString(50, y, "Nota")
-    y -= 16
+    c.drawString(x + 0.7 * cm, y + h - 4.4 * cm, f"Entrada sugerida: {plan['entrada']}")
+
+    c.setFont("Helvetica", 11)
+    c.drawString(x + 0.7 * cm, y + h - 5.6 * cm, f"SL1: {plan['sl1']}   |   SL2: {plan['sl2']}")
+
+    c.drawString(x + 0.7 * cm, y + h - 6.8 * cm, f"TP1: {plan['tp1']}   |   TP2: {plan['tp2']}")
+
+    c.drawString(x + 0.7 * cm, y + h - 8.0 * cm, f"RR aprox (TP1): {plan['rr_aprox_tp1']}")
+
     c.setFont("Helvetica", 9)
-    c.drawString(50, y, data["nota"])
+    c.drawString(x + 0.7 * cm, y + 1.2 * cm, f"Hora sugerencia (última vela 1H): {plan['hora_sugerencia']}")
 
-    y -= 25
+    # Nota
+    c.setFont("Helvetica", 9)
+    text = c.beginText(x + 0.7 * cm, y + 3.0 * cm)
+    text.setLeading(12)
+    text.textLines("Nota:")
+    for line in split_text(plan["nota"], 95):
+        text.textLine(line)
+    c.drawText(text)
+
+    # Footer
     c.setFont("Helvetica-Oblique", 8)
-    c.drawString(50, y, "Aviso: Esto es apoyo educativo. No es asesoría financiera.")
+    c.drawString(
+        2 * cm,
+        1.2 * cm,
+        "Aviso: Esto es apoyo estadístico/automatizado. No es asesoría financiera.",
+    )
 
+    c.showPage()
     c.save()
-    return filename
+    buffer.seek(0)
+    return buffer.read()
 
 
-# =========================================================
+def split_text(text, max_len=90):
+    words = text.split()
+    lines = []
+    current = ""
+    for w in words:
+        if len(current) + len(w) + 1 <= max_len:
+            current += (" " if current else "") + w
+        else:
+            lines.append(current)
+            current = w
+    if current:
+        lines.append(current)
+    return lines
+
+
+# ============================================================
 # ENDPOINTS
-# =========================================================
-@app.get("/analisis")
-def analisis(ticker: str = Query(..., description="Ej: BTC-USD, AAPL, TSLA")):
-    df_1h, df_4h = fetch_data(ticker)
-    if df_1h is None:
-        return JSONResponse({"error": "No se pudieron descargar datos. Revisa ticker."}, status_code=400)
+# ============================================================
 
-    data = analyze_pullback(df_1h, df_4h)
-    data["ticker"] = ticker.upper()
-    return data
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "API IA Trading Pullback funcionando"}
+
+
+@app.get("/analyze")
+def analyze(ticker: str = Query(..., description="Ticker ejemplo: AAPL, TSLA, NVDA, SPY")):
+    try:
+        df_1h, df_4h = download_data(ticker)
+        plan = detect_pullback_plan(df_4h, df_1h)
+        plan["ticker"] = ticker.upper()
+        return JSONResponse(plan)
+    except Exception as e:
+        return JSONResponse(
+            status_code=400,
+            content={"error": str(e), "ticker": ticker},
+        )
 
 
 @app.get("/pdf")
-def pdf(ticker: str = Query(...)):
-    df_1h, df_4h = fetch_data(ticker)
-    if df_1h is None:
-        return JSONResponse({"error": "No se pudieron descargar datos. Revisa ticker."}, status_code=400)
+def pdf(ticker: str = Query(..., description="Ticker ejemplo: AAPL, TSLA, NVDA, SPY")):
+    try:
+        df_1h, df_4h = download_data(ticker)
+        plan = detect_pullback_plan(df_4h, df_1h)
+        plan["ticker"] = ticker.upper()
 
-    data = analyze_pullback(df_1h, df_4h)
-    pdf_file = create_pdf(data, ticker.upper())
+        pdf_bytes = build_pdf(plan)
 
-    return FileResponse(
-        pdf_file,
-        media_type="application/pdf",
-        filename=pdf_file
-    )
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'attachment; filename="IA_Trading_{ticker.upper()}.pdf"'
+            },
+        )
+    except Exception as e:
+        return JSONResponse(
+            status_code=400,
+            content={"error": str(e), "ticker": ticker},
+        )
