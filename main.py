@@ -16,16 +16,57 @@ import tempfile
 # APP
 # ============================================================
 
-app = FastAPI(title="IA Trading Pullback API", version="1.0")
+app = FastAPI(title="IA Trading Pullback API", version="1.1")
 
-# CORS (para que Google Apps Script pueda consumir)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # puedes restringir después
+    allow_origins=["*"],  # luego puedes restringir a tu Apps Script
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ============================================================
+# HELPERS: NORMALIZAR DATAFRAME
+# ============================================================
+
+def normalize_ohlcv(df: pd.DataFrame):
+    """
+    Asegura que el dataframe tenga:
+    Open, High, Low, Close, Volume
+    """
+    if df is None or df.empty:
+        return None
+
+    df = df.copy()
+    df = df.dropna()
+
+    # yfinance a veces devuelve columnas con nombres raros o minúsculas
+    rename_map = {}
+    for c in df.columns:
+        cl = str(c).lower()
+        if cl == "open":
+            rename_map[c] = "Open"
+        elif cl == "high":
+            rename_map[c] = "High"
+        elif cl == "low":
+            rename_map[c] = "Low"
+        elif cl == "close":
+            rename_map[c] = "Close"
+        elif cl == "volume":
+            rename_map[c] = "Volume"
+
+    df = df.rename(columns=rename_map)
+
+    required = {"Open", "High", "Low", "Close", "Volume"}
+    if not required.issubset(set(df.columns)):
+        return None
+
+    df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
+
+    return df
 
 
 # ============================================================
@@ -127,16 +168,50 @@ def cluster_levels(levels, current_price, tolerance_pct=0.004):
 
 
 # ============================================================
-# DESCARGA DATOS
+# DESCARGA DATOS (ROBUSTA PARA CLOUD)
 # ============================================================
 
-def download_1h_data(ticker, period="1mo"):
-    df = yf.download(ticker, period=period, interval="1h", auto_adjust=False, progress=False)
-    if df is None or df.empty:
+def download_intraday_data(ticker, period="1mo", interval="1h"):
+    """
+    Usa yf.Ticker().history() que funciona mejor en Railway/Render.
+    """
+    try:
+        t = yf.Ticker(ticker)
+        df = t.history(period=period, interval=interval)
+
+        df = normalize_ohlcv(df)
+        return df
+    except Exception:
         return None
-    df = df.dropna()
-    df.index = pd.to_datetime(df.index)
-    return df
+
+
+def download_1h_data_with_fallback(ticker, period="1mo"):
+    """
+    1) Intenta 1H
+    2) Si falla, intenta 30m y lo convierte a 1H
+    """
+    df1h = download_intraday_data(ticker, period=period, interval="1h")
+    if df1h is not None and not df1h.empty:
+        return df1h
+
+    # fallback 30m
+    df30 = download_intraday_data(ticker, period=period, interval="30m")
+    if df30 is None or df30.empty:
+        return None
+
+    # resample a 1H desde 30m
+    o = df30["Open"].resample("1H").first()
+    h = df30["High"].resample("1H").max()
+    l = df30["Low"].resample("1H").min()
+    c = df30["Close"].resample("1H").last()
+    v = df30["Volume"].resample("1H").sum()
+
+    df1 = pd.concat([o, h, l, c, v], axis=1)
+    df1.columns = ["Open", "High", "Low", "Close", "Volume"]
+    df1 = df1.dropna()
+
+    return df1
+
 
 def resample_to_4h(df_1h):
     o = df_1h["Open"].resample("4H").first()
@@ -146,7 +221,7 @@ def resample_to_4h(df_1h):
     v = df_1h["Volume"].resample("4H").sum()
 
     df4 = pd.concat([o, h, l, c, v], axis=1)
-    df4.columns = ["Open","High","Low","Close","Volume"]
+    df4.columns = ["Open", "High", "Low", "Close", "Volume"]
     df4 = df4.dropna()
     return df4
 
@@ -177,10 +252,8 @@ def trend_4h(df4):
 # ============================================================
 
 def detect_bos_1h(df1, direction):
-    df = df1.copy()
-    close = float(df["Close"].iloc[-1])
-
-    ph, pl = pivots(df, 3, 3)
+    close = float(df1["Close"].iloc[-1])
+    ph, pl = pivots(df1, 3, 3)
 
     if direction == "LONG":
         if not ph:
@@ -223,14 +296,14 @@ def compute_pullback_entry(df1, direction):
     if direction == "LONG":
         entry = ema20
         if rsi_now > 68:
-            entry = min(entry, ema20 - 0.25*atr_now)
-        if abs(price - entry) <= 0.25*atr_now:
+            entry = min(entry, ema20 - 0.25 * atr_now)
+        if abs(price - entry) <= 0.25 * atr_now:
             entry = price
     else:
         entry = ema20
         if rsi_now < 32:
-            entry = max(entry, ema20 + 0.25*atr_now)
-        if abs(price - entry) <= 0.25*atr_now:
+            entry = max(entry, ema20 + 0.25 * atr_now)
+        if abs(price - entry) <= 0.25 * atr_now:
             entry = price
 
     return entry, atr_now, ema20, ema50, rsi_now
@@ -241,9 +314,6 @@ def compute_pullback_entry(df1, direction):
 # ============================================================
 
 def build_swing_plan_pro(df1, df4, ticker):
-    df1 = df1.copy()
-    df4 = df4.copy()
-
     current_price = float(df1["Close"].iloc[-1])
     tendencia = trend_4h(df4)
 
@@ -271,45 +341,45 @@ def build_swing_plan_pro(df1, df4, ticker):
     swing_high = last_swing_high(df1)
 
     if swing_low is None:
-        swing_low = current_price - 2.2*atr_now
+        swing_low = current_price - 2.2 * atr_now
     if swing_high is None:
-        swing_high = current_price + 2.2*atr_now
+        swing_high = current_price + 2.2 * atr_now
 
     if direction == "LONG":
-        sl1 = entry - 1.4*atr_now
-        sl2 = min(swing_low - 0.25*atr_now, entry - 2.2*atr_now)
+        sl1 = entry - 1.4 * atr_now
+        sl2 = min(swing_low - 0.25 * atr_now, entry - 2.2 * atr_now)
 
-        tp1 = resistances[0] if resistances else entry + 2.2*atr_now
-        tp2 = resistances[1] if len(resistances) >= 2 else entry + 3.4*atr_now
+        tp1 = resistances[0] if resistances else entry + 2.2 * atr_now
+        tp2 = resistances[1] if len(resistances) >= 2 else entry + 3.4 * atr_now
 
         risk = entry - sl1
         if risk <= 0:
-            sl1 = entry - 1.4*atr_now
+            sl1 = entry - 1.4 * atr_now
             risk = entry - sl1
 
-        if (tp1 - entry) < 1.6*risk:
-            tp1 = entry + 1.6*risk
+        if (tp1 - entry) < 1.6 * risk:
+            tp1 = entry + 1.6 * risk
         if tp2 <= tp1:
-            tp2 = tp1 + 1.0*risk
+            tp2 = tp1 + 1.0 * risk
 
         rr = (tp1 - entry) / risk
 
     else:
-        sl1 = entry + 1.4*atr_now
-        sl2 = max(swing_high + 0.25*atr_now, entry + 2.2*atr_now)
+        sl1 = entry + 1.4 * atr_now
+        sl2 = max(swing_high + 0.25 * atr_now, entry + 2.2 * atr_now)
 
-        tp1 = supports[-1] if supports else entry - 2.2*atr_now
-        tp2 = supports[-2] if len(supports) >= 2 else entry - 3.4*atr_now
+        tp1 = supports[-1] if supports else entry - 2.2 * atr_now
+        tp2 = supports[-2] if len(supports) >= 2 else entry - 3.4 * atr_now
 
         risk = sl1 - entry
         if risk <= 0:
-            sl1 = entry + 1.4*atr_now
+            sl1 = entry + 1.4 * atr_now
             risk = sl1 - entry
 
-        if (entry - tp1) < 1.6*risk:
-            tp1 = entry - 1.6*risk
+        if (entry - tp1) < 1.6 * risk:
+            tp1 = entry - 1.6 * risk
         if tp2 >= tp1:
-            tp2 = tp1 - 1.0*risk
+            tp2 = tp1 - 1.0 * risk
 
         rr = (entry - tp1) / risk
 
@@ -327,18 +397,18 @@ def build_swing_plan_pro(df1, df4, ticker):
 
     plan = {
         "ticker": ticker,
-        "fecha_hora": now.strftime("%Y-%m-%d %H:%M:%S %Z"),
-        "tendencia_4h": tendencia,
+        "timestamp_utc": now.strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "sesgo_4h": tendencia,
         "direccion": direction,
         "confirmacion": confirmacion,
         "nivel_bos": fmt(bos_level) if bos_level else None,
         "precio_actual": fmt(current_price),
-        "entrada_sugerida": fmt(entry),
+        "entrada_pullback": fmt(entry),
         "sl1": fmt(sl1),
         "sl2": fmt(sl2),
         "tp1": fmt(tp1),
         "tp2": fmt(tp2),
-        "rr_aprox_tp1": round(float(rr), 2),
+        "rr_aprox_tp1_sl1": round(float(rr), 2),
         "nota": "Estrategia PRO: tendencia 4H + pullback a EMA20 1H + SL doble + TP por resistencias + RR mínimo."
     }
 
@@ -363,11 +433,11 @@ def export_pdf(plan, filename):
         y -= lh
 
     write("📈 Resumen IA SwingTrading PRO (Pullback)", bold=True, size=15)
-    write(f"Generado: {plan['fecha_hora']}")
+    write(f"Generado: {plan['timestamp_utc']}")
     y -= 10
 
     write(f"Ticker: {plan['ticker']}", bold=True)
-    write(f"Tendencia 4H: {plan['tendencia_4h']}")
+    write(f"Sesgo 4H: {plan['sesgo_4h']}")
     write(f"Dirección sugerida: {plan['direccion']}", bold=True)
     write(f"Confirmación: {plan['confirmacion']}")
     if plan["nivel_bos"]:
@@ -376,12 +446,12 @@ def export_pdf(plan, filename):
 
     write("📌 Plan sugerido", bold=True)
     write(f"Precio actual: {plan['precio_actual']}")
-    write(f"Entrada sugerida: {plan['entrada_sugerida']}")
+    write(f"Entrada sugerida (pullback): {plan['entrada_pullback']}")
     write(f"SL1: {plan['sl1']}")
     write(f"SL2: {plan['sl2']}")
     write(f"TP1: {plan['tp1']}")
     write(f"TP2: {plan['tp2']}")
-    write(f"RR aprox (TP1): {plan['rr_aprox_tp1']}")
+    write(f"RR aprox (TP1/SL1): {plan['rr_aprox_tp1_sl1']}")
     y -= 10
 
     write("🧠 Nota", bold=True)
@@ -401,18 +471,22 @@ def export_pdf(plan, filename):
 def root():
     return {"status": "ok", "message": "IA Trading Pullback API running"}
 
+
 @app.get("/analizar")
 def analizar(ticker: str):
     try:
         ticker = ticker.strip().upper()
 
-        df1 = download_1h_data(ticker, period="1mo")
+        df1 = download_1h_data_with_fallback(ticker, period="1mo")
         if df1 is None or df1.empty:
-            return JSONResponse({"error": "No se pudieron descargar datos 1H. Revisa ticker."}, status_code=400)
+            return JSONResponse(
+                {"error": "No se pudieron descargar datos intraday (1H/30m). Yahoo puede estar bloqueando Railway."},
+                status_code=400
+            )
 
         df4 = resample_to_4h(df1)
         if df4 is None or df4.empty:
-            return JSONResponse({"error": "No se pudo generar 4H desde 1H."}, status_code=400)
+            return JSONResponse({"error": "No se pudo generar 4H desde intraday."}, status_code=400)
 
         plan = build_swing_plan_pro(df1, df4, ticker)
         return plan
@@ -420,18 +494,22 @@ def analizar(ticker: str):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
+
 @app.get("/pdf")
 def pdf(ticker: str):
     try:
         ticker = ticker.strip().upper()
 
-        df1 = download_1h_data(ticker, period="1mo")
+        df1 = download_1h_data_with_fallback(ticker, period="1mo")
         if df1 is None or df1.empty:
-            return JSONResponse({"error": "No se pudieron descargar datos 1H. Revisa ticker."}, status_code=400)
+            return JSONResponse(
+                {"error": "No se pudieron descargar datos intraday (1H/30m)."},
+                status_code=400
+            )
 
         df4 = resample_to_4h(df1)
         if df4 is None or df4.empty:
-            return JSONResponse({"error": "No se pudo generar 4H desde 1H."}, status_code=400)
+            return JSONResponse({"error": "No se pudo generar 4H desde intraday."}, status_code=400)
 
         plan = build_swing_plan_pro(df1, df4, ticker)
 
