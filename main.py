@@ -1,520 +1,330 @@
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse, FileResponse
-from fastapi.middleware.cors import CORSMiddleware
-
-import pandas as pd
+import os
+import io
+import time
+import math
+import requests
 import numpy as np
-import httpx
+import pandas as pd
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+from fastapi import FastAPI, Query
+from fastapi.responses import JSONResponse, StreamingResponse
+
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
-import os
-import tempfile
-
-
-# ============================================================
-# APP
-# ============================================================
-
-app = FastAPI(title="IA Trading Pullback API", version="2.0 (Finnhub)")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
-FINNHUB_BASE = "https://finnhub.io/api/v1"
+ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "").strip()
+
+app = FastAPI(title="IA Trading Pullback API", version="1.0")
 
 
 # ============================================================
-# INDICADORES
+# UTILS
 # ============================================================
 
-def ema(series, period=20):
+def _safe_float(x, default=np.nan):
+    try:
+        return float(x)
+    except:
+        return default
+
+
+def _now_utc_str():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _normalize_ticker(ticker: str) -> str:
+    return ticker.strip().upper()
+
+
+# ============================================================
+# DATA DOWNLOAD (ALPHA VANTAGE)
+# ============================================================
+
+def descargar_intraday_60min_alpha_vantage(ticker: str) -> pd.DataFrame:
+    """
+    Descarga velas intraday 60min desde Alpha Vantage.
+    Retorna DataFrame con columnas:
+    datetime, open, high, low, close, volume
+    """
+
+    if not ALPHAVANTAGE_API_KEY:
+        raise RuntimeError("Falta ALPHAVANTAGE_API_KEY en variables de Railway.")
+
+    url = "https://www.alphavantage.co/query"
+    params = {
+        "function": "TIME_SERIES_INTRADAY",
+        "symbol": ticker,
+        "interval": "60min",
+        "outputsize": "compact",  # últimas ~100 velas
+        "apikey": ALPHAVANTAGE_API_KEY
+    }
+
+    r = requests.get(url, params=params, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"AlphaVantage HTTP {r.status_code}: {r.text[:200]}")
+
+    data = r.json()
+
+    # Errores típicos
+    if "Error Message" in data:
+        raise RuntimeError(f"AlphaVantage Error: {data['Error Message']}")
+    if "Note" in data:
+        # rate limit
+        raise RuntimeError(f"AlphaVantage RateLimit: {data['Note']}")
+    if "Information" in data:
+        raise RuntimeError(f"AlphaVantage Info: {data['Information']}")
+
+    key = "Time Series (60min)"
+    if key not in data:
+        raise RuntimeError(f"No viene '{key}' en respuesta. Respuesta: {str(data)[:250]}")
+
+    rows = []
+    for dt_str, values in data[key].items():
+        rows.append({
+            "datetime": pd.to_datetime(dt_str),
+            "open": _safe_float(values.get("1. open")),
+            "high": _safe_float(values.get("2. high")),
+            "low": _safe_float(values.get("3. low")),
+            "close": _safe_float(values.get("4. close")),
+            "volume": _safe_float(values.get("5. volume")),
+        })
+
+    df = pd.DataFrame(rows).sort_values("datetime").reset_index(drop=True)
+
+    # limpieza
+    df = df.dropna(subset=["open", "high", "low", "close"])
+
+    if len(df) < 50:
+        raise RuntimeError("Muy pocas velas descargadas (menos de 50).")
+
+    return df
+
+
+# ============================================================
+# INDICATORS
+# ============================================================
+
+def ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
 
-def atr(df, period=14):
-    high = df["High"]
-    low = df["Low"]
-    close = df["Close"]
 
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        (high - low),
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
-    ], axis=1).max(axis=1)
-
-    return tr.rolling(period).mean()
-
-def rsi(series, period=14):
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = (-delta).clip(lower=0)
-
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
     avg_gain = gain.rolling(period).mean()
     avg_loss = loss.rolling(period).mean()
-
-    rs = avg_gain / (avg_loss + 1e-9)
+    rs = avg_gain / avg_loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
 
-# ============================================================
-# PIVOTS
-# ============================================================
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    prev_close = close.shift(1)
 
-def pivots(df, left=3, right=3):
-    highs = df["High"].values
-    lows  = df["Low"].values
-    idxs = df.index
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
 
-    ph = []
-    pl = []
-
-    for i in range(left, len(df)-right):
-        wh = highs[i-left:i+right+1]
-        wl = lows[i-left:i+right+1]
-
-        if highs[i] == wh.max():
-            ph.append((idxs[i], float(highs[i])))
-
-        if lows[i] == wl.min():
-            pl.append((idxs[i], float(lows[i])))
-
-    return ph, pl
-
-def last_swing_low(df):
-    _, pl = pivots(df, 3, 3)
-    return pl[-1][1] if pl else None
-
-def last_swing_high(df):
-    ph, _ = pivots(df, 3, 3)
-    return ph[-1][1] if ph else None
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
 
 
 # ============================================================
-# SOPORTE / RESISTENCIA
+# STRATEGY (PULLBACK SIMPLE)
 # ============================================================
 
-def pivot_levels(df, left=3, right=3):
-    ph, pl = pivots(df, left, right)
-    levels = [p for _, p in ph] + [p for _, p in pl]
-    return levels
-
-def cluster_levels(levels, current_price, tolerance_pct=0.004):
-    if not levels:
-        return []
-
-    levels = sorted(levels)
-    clustered = []
-    bucket = [levels[0]]
-
-    for lvl in levels[1:]:
-        ref = np.mean(bucket)
-        tol = ref * tolerance_pct
-        if abs(lvl - ref) <= tol:
-            bucket.append(lvl)
-        else:
-            clustered.append(np.mean(bucket))
-            bucket = [lvl]
-
-    clustered.append(np.mean(bucket))
-
-    filtered = [x for x in clustered if (current_price*0.65 <= x <= current_price*1.35)]
-    return sorted(filtered)
-
-
-# ============================================================
-# FINNHUB: DESCARGA 1H
-# ============================================================
-
-async def finnhub_get_1h_candles(symbol: str, days_back: int = 30):
+def analizar_pullback(df: pd.DataFrame) -> dict:
     """
-    Descarga velas 1H desde Finnhub.
-
-    Finnhub entrega:
-    t: timestamps
-    o,h,l,c: arrays
-    v: volumen
-
-    IMPORTANTE:
-    - Finnhub requiere API KEY
-    - Para acciones/ETFs, 1H funciona bien.
+    Estrategia simple:
+    - Tendencia: EMA20 > EMA50 (bull)
+    - Pullback: precio toca/cae cerca EMA20 y RSI se recupera
+    - Stop: close - 1.5*ATR
+    - TP: close + 2.5*ATR
     """
 
-    if not FINNHUB_API_KEY:
-        return None, "Falta FINNHUB_API_KEY en variables de Railway."
+    df = df.copy()
 
-    now = datetime.now(timezone.utc)
-    frm = now - timedelta(days=days_back)
-
-    params = {
-        "symbol": symbol,
-        "resolution": "60",  # 1H
-        "from": int(frm.timestamp()),
-        "to": int(now.timestamp()),
-        "token": FINNHUB_API_KEY
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.get(f"{FINNHUB_BASE}/stock/candle", params=params)
-
-        if r.status_code != 200:
-            return None, f"Finnhub HTTP {r.status_code}: {r.text}"
-
-        data = r.json()
-
-        # status ok: "s": "ok"
-        if not data or data.get("s") != "ok":
-            return None, f"Finnhub no devolvió velas: {data}"
-
-        df = pd.DataFrame({
-            "Open": data["o"],
-            "High": data["h"],
-            "Low": data["l"],
-            "Close": data["c"],
-            "Volume": data["v"],
-        })
-
-        # index con timestamps
-        df.index = pd.to_datetime(data["t"], unit="s", utc=True)
-
-        df = df.dropna()
-        if df.empty:
-            return None, "Finnhub devolvió DF vacío."
-
-        return df, None
-
-    except Exception as e:
-        return None, f"Error Finnhub: {str(e)}"
-
-
-def resample_to_4h(df_1h):
-    o = df_1h["Open"].resample("4H").first()
-    h = df_1h["High"].resample("4H").max()
-    l = df_1h["Low"].resample("4H").min()
-    c = df_1h["Close"].resample("4H").last()
-    v = df_1h["Volume"].resample("4H").sum()
-
-    df4 = pd.concat([o, h, l, c, v], axis=1)
-    df4.columns = ["Open", "High", "Low", "Close", "Volume"]
-    df4 = df4.dropna()
-    return df4
-
-
-# ============================================================
-# TENDENCIA 4H
-# ============================================================
-
-def trend_4h(df4):
-    df = df4.copy()
-    df["EMA20"] = ema(df["Close"], 20)
-    df["EMA50"] = ema(df["Close"], 50)
+    df["ema20"] = ema(df["close"], 20)
+    df["ema50"] = ema(df["close"], 50)
+    df["rsi14"] = rsi(df["close"], 14)
+    df["atr14"] = atr(df, 14)
 
     last = df.iloc[-1]
-    close = float(last["Close"])
-    e20 = float(last["EMA20"])
-    e50 = float(last["EMA50"])
 
-    if e20 > e50 and close > e20:
-        return "ALCISTA"
-    if e20 < e50 and close < e20:
-        return "BAJISTA"
-    return "LATERAL"
+    close = float(last["close"])
+    ema20v = float(last["ema20"])
+    ema50v = float(last["ema50"])
+    rsiv = float(last["rsi14"]) if not math.isnan(last["rsi14"]) else None
+    atrv = float(last["atr14"]) if not math.isnan(last["atr14"]) else None
 
+    tendencia = "ALCISTA" if ema20v > ema50v else "BAJISTA"
 
-# ============================================================
-# BOS 1H
-# ============================================================
+    # Pullback simple
+    cerca_ema20 = abs(close - ema20v) / close < 0.01  # dentro de 1%
+    rsi_ok = (rsiv is not None) and (rsiv > 45)
 
-def detect_bos_1h(df1, direction):
-    df = df1.copy()
-    close = float(df["Close"].iloc[-1])
-
-    ph, pl = pivots(df, 3, 3)
-
-    if direction == "LONG":
-        if not ph:
-            return False, None
-        last_pivot_high = ph[-1][1]
-        return close > last_pivot_high, last_pivot_high
-
-    if direction == "SHORT":
-        if not pl:
-            return False, None
-        last_pivot_low = pl[-1][1]
-        return close < last_pivot_low, last_pivot_low
-
-    return False, None
-
-
-# ============================================================
-# ENTRADA PULLBACK
-# ============================================================
-
-def compute_pullback_entry(df1, direction):
-    df = df1.copy()
-
-    df["EMA20"] = ema(df["Close"], 20)
-    df["EMA50"] = ema(df["Close"], 50)
-    df["ATR14"] = atr(df, 14)
-    df["RSI14"] = rsi(df["Close"], 14)
-
-    last = df.iloc[-1]
-    price = float(last["Close"])
-    atr_now = float(last["ATR14"])
-
-    if np.isnan(atr_now) or atr_now == 0:
-        atr_now = price * 0.007
-
-    ema20 = float(last["EMA20"])
-    ema50 = float(last["EMA50"])
-    rsi_now = float(last["RSI14"])
-
-    if direction == "LONG":
-        entry = ema20
-        if rsi_now > 68:
-            entry = min(entry, ema20 - 0.25 * atr_now)
-        if abs(price - entry) <= 0.25 * atr_now:
-            entry = price
-    else:
-        entry = ema20
-        if rsi_now < 32:
-            entry = max(entry, ema20 + 0.25 * atr_now)
-        if abs(price - entry) <= 0.25 * atr_now:
-            entry = price
-
-    return entry, atr_now, ema20, ema50, rsi_now
-
-
-# ============================================================
-# PLAN PRO
-# ============================================================
-
-def build_swing_plan_pro(df1, df4, ticker):
-    df1 = df1.copy()
-    df4 = df4.copy()
-
-    current_price = float(df1["Close"].iloc[-1])
-    tendencia = trend_4h(df4)
+    señal = "NO"
+    motivo = []
 
     if tendencia == "ALCISTA":
-        direction = "LONG"
-    elif tendencia == "BAJISTA":
-        direction = "SHORT"
-    else:
-        e50_1h = ema(df1["Close"], 50).iloc[-1]
-        direction = "LONG" if current_price > e50_1h else "SHORT"
+        motivo.append("EMA20 > EMA50 (tendencia alcista)")
+        if cerca_ema20:
+            motivo.append("Precio cerca de EMA20 (pullback)")
+        else:
+            motivo.append("Precio NO está cerca de EMA20")
+        if rsi_ok:
+            motivo.append("RSI > 45 (momentum recuperando)")
+        else:
+            motivo.append("RSI NO confirma (>45)")
 
-    entry, atr_now, ema20, ema50, rsi_now = compute_pullback_entry(df1, direction)
-    bos_ok, bos_level = detect_bos_1h(df1, direction)
-
-    levels = cluster_levels(
-        pivot_levels(df1, 3, 3) + pivot_levels(df4, 2, 2),
-        current_price,
-        tolerance_pct=0.004
-    )
-
-    supports = sorted([x for x in levels if x < current_price])
-    resistances = sorted([x for x in levels if x > current_price])
-
-    swing_low = last_swing_low(df1)
-    swing_high = last_swing_high(df1)
-
-    if swing_low is None:
-        swing_low = current_price - 2.2 * atr_now
-    if swing_high is None:
-        swing_high = current_price + 2.2 * atr_now
-
-    if direction == "LONG":
-        sl1 = entry - 1.4 * atr_now
-        sl2 = min(swing_low - 0.25 * atr_now, entry - 2.2 * atr_now)
-
-        tp1 = resistances[0] if resistances else entry + 2.2 * atr_now
-        tp2 = resistances[1] if len(resistances) >= 2 else entry + 3.4 * atr_now
-
-        risk = entry - sl1
-        if risk <= 0:
-            sl1 = entry - 1.4 * atr_now
-            risk = entry - sl1
-
-        if (tp1 - entry) < 1.6 * risk:
-            tp1 = entry + 1.6 * risk
-        if tp2 <= tp1:
-            tp2 = tp1 + 1.0 * risk
-
-        rr = (tp1 - entry) / risk
+        if cerca_ema20 and rsi_ok:
+            señal = "LONG"
 
     else:
-        sl1 = entry + 1.4 * atr_now
-        sl2 = max(swing_high + 0.25 * atr_now, entry + 2.2 * atr_now)
+        motivo.append("EMA20 <= EMA50 (tendencia bajista)")
 
-        tp1 = supports[-1] if supports else entry - 2.2 * atr_now
-        tp2 = supports[-2] if len(supports) >= 2 else entry - 3.4 * atr_now
+    # niveles
+    if atrv is None or math.isnan(atrv):
+        stop = None
+        tp = None
+    else:
+        stop = close - 1.5 * atrv
+        tp = close + 2.5 * atrv
 
-        risk = sl1 - entry
-        if risk <= 0:
-            sl1 = entry + 1.4 * atr_now
-            risk = sl1 - entry
-
-        if (entry - tp1) < 1.6 * risk:
-            tp1 = entry - 1.6 * risk
-        if tp2 >= tp1:
-            tp2 = tp1 - 1.0 * risk
-
-        rr = (entry - tp1) / risk
-
-    confirmacion = "CONFIRMADO (BOS detectado en 1H)" if bos_ok else "NO confirmado (esperar BOS en 1H)"
-
-    def fmt(x):
-        if x is None:
-            return None
-        x = float(x)
-        if x >= 10:
-            return round(x, 2)
-        return round(x, 5)
-
-    now = datetime.now().astimezone()
-
-    plan = {
-        "ticker": ticker,
-        "fecha_hora": now.strftime("%Y-%m-%d %H:%M:%S %Z"),
-        "tendencia_4h": tendencia,
-        "direccion": direction,
-        "confirmacion": confirmacion,
-        "nivel_bos": fmt(bos_level) if bos_level else None,
-        "precio_actual": fmt(current_price),
-        "entrada_sugerida": fmt(entry),
-        "sl1": fmt(sl1),
-        "sl2": fmt(sl2),
-        "tp1": fmt(tp1),
-        "tp2": fmt(tp2),
-        "rr_aprox_tp1": round(float(rr), 2),
-        "nota": "Estrategia PRO: Finnhub 1H + tendencia 4H + pullback EMA20 1H + SL doble + TP por resistencias + RR mínimo."
+    return {
+        "close": close,
+        "ema20": ema20v,
+        "ema50": ema50v,
+        "rsi14": rsiv,
+        "atr14": atrv,
+        "tendencia": tendencia,
+        "senal": señal,
+        "motivo": motivo,
+        "stop_loss": stop,
+        "take_profit": tp,
+        "timestamp": _now_utc_str()
     }
 
-    return plan
-
 
 # ============================================================
-# PDF
-# ============================================================
-
-def export_pdf(plan, filename):
-    c = canvas.Canvas(filename, pagesize=letter)
-    w, h = letter
-
-    y = h - 55
-    lh = 18
-
-    def write(text, bold=False, size=11):
-        nonlocal y
-        c.setFont("Helvetica-Bold" if bold else "Helvetica", size)
-        c.drawString(50, y, str(text))
-        y -= lh
-
-    write("📈 Resumen IA SwingTrading PRO (Pullback)", bold=True, size=15)
-    write(f"Generado: {plan['fecha_hora']}")
-    y -= 10
-
-    write(f"Ticker: {plan['ticker']}", bold=True)
-    write(f"Tendencia 4H: {plan['tendencia_4h']}")
-    write(f"Dirección sugerida: {plan['direccion']}", bold=True)
-    write(f"Confirmación: {plan['confirmacion']}")
-    if plan["nivel_bos"]:
-        write(f"Nivel BOS (referencia): {plan['nivel_bos']}")
-    y -= 10
-
-    write("📌 Plan sugerido", bold=True)
-    write(f"Precio actual: {plan['precio_actual']}")
-    write(f"Entrada sugerida: {plan['entrada_sugerida']}")
-    write(f"SL1: {plan['sl1']}")
-    write(f"SL2: {plan['sl2']}")
-    write(f"TP1: {plan['tp1']}")
-    write(f"TP2: {plan['tp2']}")
-    write(f"RR aprox (TP1): {plan['rr_aprox_tp1']}")
-    y -= 10
-
-    write("🧠 Nota", bold=True)
-    write(plan["nota"], size=9)
-    y -= 8
-    write("Aviso: Esto NO es asesoría financiera. Es un apoyo automatizado.", size=8)
-
-    c.showPage()
-    c.save()
-
-
-# ============================================================
-# ENDPOINTS
+# ROUTES
 # ============================================================
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "IA Trading Pullback API running (Finnhub)"}    
+    return {"status": "ok", "message": "IA Trading Pullback API running", "timestamp": _now_utc_str()}
 
 
 @app.get("/analizar")
-async def analizar(ticker: str):
+def analizar(ticker: str = Query(..., description="Ej: AAPL, SPY, QQQ")):
     try:
-        ticker = ticker.strip().upper()
+        ticker = _normalize_ticker(ticker)
 
-        df1, err = await finnhub_get_1h_candles(ticker, days_back=30)
-        if df1 is None or df1.empty:
-            return JSONResponse(
-                {"error": f"No se pudieron descargar velas 1H desde Finnhub. {err}"},
-                status_code=400
-            )
+        df = descargar_intraday_60min_alpha_vantage(ticker)
+        result = analizar_pullback(df)
 
-        df4 = resample_to_4h(df1)
-        if df4 is None or df4.empty:
-            return JSONResponse({"error": "No se pudo generar 4H desde 1H."}, status_code=400)
-
-        plan = build_swing_plan_pro(df1, df4, ticker)
-        return plan
+        return {
+            "ticker": ticker,
+            "fuente": "AlphaVantage TIME_SERIES_INTRADAY 60min",
+            "velas": len(df),
+            "resultado": result
+        }
 
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse(
+            status_code=400,
+            content={"error": str(e)}
+        )
 
 
 @app.get("/pdf")
-async def pdf(ticker: str):
+def pdf(ticker: str = Query(..., description="Ej: AAPL, SPY, QQQ")):
     try:
-        ticker = ticker.strip().upper()
+        ticker = _normalize_ticker(ticker)
 
-        df1, err = await finnhub_get_1h_candles(ticker, days_back=30)
-        if df1 is None or df1.empty:
-            return JSONResponse(
-                {"error": f"No se pudieron descargar velas 1H desde Finnhub. {err}"},
-                status_code=400
-            )
+        df = descargar_intraday_60min_alpha_vantage(ticker)
+        result = analizar_pullback(df)
 
-        df4 = resample_to_4h(df1)
-        if df4 is None or df4.empty:
-            return JSONResponse({"error": "No se pudo generar 4H desde 1H."}, status_code=400)
+        buffer = io.BytesIO()
+        c = canvas.Canvas(buffer, pagesize=letter)
 
-        plan = build_swing_plan_pro(df1, df4, ticker)
+        y = 750
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(50, y, f"IA Trading Pullback Report - {ticker}")
+        y -= 25
 
-        tmpdir = tempfile.gettempdir()
-        filename = os.path.join(tmpdir, f"Resumen_{ticker}_SwingPRO.pdf")
+        c.setFont("Helvetica", 10)
+        c.drawString(50, y, f"Fecha: {result['timestamp']}")
+        y -= 20
+        c.drawString(50, y, f"Fuente: AlphaVantage (60min)")
+        y -= 30
 
-        export_pdf(plan, filename)
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(50, y, "Resumen")
+        y -= 18
 
-        return FileResponse(
-            filename,
+        c.setFont("Helvetica", 10)
+        c.drawString(50, y, f"Señal: {result['senal']}")
+        y -= 15
+        c.drawString(50, y, f"Tendencia: {result['tendencia']}")
+        y -= 15
+        c.drawString(50, y, f"Close: {result['close']:.4f}")
+        y -= 15
+        c.drawString(50, y, f"EMA20: {result['ema20']:.4f}")
+        y -= 15
+        c.drawString(50, y, f"EMA50: {result['ema50']:.4f}")
+        y -= 15
+
+        if result["rsi14"] is not None:
+            c.drawString(50, y, f"RSI14: {result['rsi14']:.2f}")
+            y -= 15
+
+        if result["atr14"] is not None:
+            c.drawString(50, y, f"ATR14: {result['atr14']:.4f}")
+            y -= 15
+
+        y -= 10
+        if result["stop_loss"] is not None:
+            c.drawString(50, y, f"Stop Loss (1.5 ATR): {result['stop_loss']:.4f}")
+            y -= 15
+        if result["take_profit"] is not None:
+            c.drawString(50, y, f"Take Profit (2.5 ATR): {result['take_profit']:.4f}")
+            y -= 15
+
+        y -= 20
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(50, y, "Motivos")
+        y -= 18
+
+        c.setFont("Helvetica", 10)
+        for m in result["motivo"]:
+            c.drawString(60, y, f"- {m}")
+            y -= 14
+            if y < 60:
+                c.showPage()
+                y = 750
+                c.setFont("Helvetica", 10)
+
+        c.showPage()
+        c.save()
+
+        buffer.seek(0)
+
+        filename = f"reporte_{ticker}.pdf"
+        return StreamingResponse(
+            buffer,
             media_type="application/pdf",
-            filename=f"Resumen_{ticker}_SwingPRO.pdf"
+            headers={"Content-Disposition": f'inline; filename="{filename}"'}
         )
 
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse(status_code=400, content={"error": str(e)})
