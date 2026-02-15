@@ -9,3 +9,5 @@ yfinance==0.2.36
 requests==2.31.0
 python-dateutil==2.9.0.post0
 reportlab==4.0.9
+httpx==0.27.0
+
