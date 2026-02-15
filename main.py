@@ -2,10 +2,11 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime
+import httpx
+
+from datetime import datetime, timedelta, timezone
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 import os
@@ -16,11 +17,11 @@ import tempfile
 # APP
 # ============================================================
 
-app = FastAPI(title="IA Trading Pullback API", version="1.1")
+app = FastAPI(title="IA Trading Pullback API", version="2.0 (Finnhub)")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # luego puedes restringir a tu Apps Script
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -28,45 +29,11 @@ app.add_middleware(
 
 
 # ============================================================
-# HELPERS: NORMALIZAR DATAFRAME
+# CONFIG
 # ============================================================
 
-def normalize_ohlcv(df: pd.DataFrame):
-    """
-    Asegura que el dataframe tenga:
-    Open, High, Low, Close, Volume
-    """
-    if df is None or df.empty:
-        return None
-
-    df = df.copy()
-    df = df.dropna()
-
-    # yfinance a veces devuelve columnas con nombres raros o minúsculas
-    rename_map = {}
-    for c in df.columns:
-        cl = str(c).lower()
-        if cl == "open":
-            rename_map[c] = "Open"
-        elif cl == "high":
-            rename_map[c] = "High"
-        elif cl == "low":
-            rename_map[c] = "Low"
-        elif cl == "close":
-            rename_map[c] = "Close"
-        elif cl == "volume":
-            rename_map[c] = "Volume"
-
-    df = df.rename(columns=rename_map)
-
-    required = {"Open", "High", "Low", "Close", "Volume"}
-    if not required.issubset(set(df.columns)):
-        return None
-
-    df.index = pd.to_datetime(df.index)
-    df = df.sort_index()
-
-    return df
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
+FINNHUB_BASE = "https://finnhub.io/api/v1"
 
 
 # ============================================================
@@ -168,49 +135,69 @@ def cluster_levels(levels, current_price, tolerance_pct=0.004):
 
 
 # ============================================================
-# DESCARGA DATOS (ROBUSTA PARA CLOUD)
+# FINNHUB: DESCARGA 1H
 # ============================================================
 
-def download_intraday_data(ticker, period="1mo", interval="1h"):
+async def finnhub_get_1h_candles(symbol: str, days_back: int = 30):
     """
-    Usa yf.Ticker().history() que funciona mejor en Railway/Render.
+    Descarga velas 1H desde Finnhub.
+
+    Finnhub entrega:
+    t: timestamps
+    o,h,l,c: arrays
+    v: volumen
+
+    IMPORTANTE:
+    - Finnhub requiere API KEY
+    - Para acciones/ETFs, 1H funciona bien.
     """
+
+    if not FINNHUB_API_KEY:
+        return None, "Falta FINNHUB_API_KEY en variables de Railway."
+
+    now = datetime.now(timezone.utc)
+    frm = now - timedelta(days=days_back)
+
+    params = {
+        "symbol": symbol,
+        "resolution": "60",  # 1H
+        "from": int(frm.timestamp()),
+        "to": int(now.timestamp()),
+        "token": FINNHUB_API_KEY
+    }
+
     try:
-        t = yf.Ticker(ticker)
-        df = t.history(period=period, interval=interval)
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(f"{FINNHUB_BASE}/stock/candle", params=params)
 
-        df = normalize_ohlcv(df)
-        return df
-    except Exception:
-        return None
+        if r.status_code != 200:
+            return None, f"Finnhub HTTP {r.status_code}: {r.text}"
 
+        data = r.json()
 
-def download_1h_data_with_fallback(ticker, period="1mo"):
-    """
-    1) Intenta 1H
-    2) Si falla, intenta 30m y lo convierte a 1H
-    """
-    df1h = download_intraday_data(ticker, period=period, interval="1h")
-    if df1h is not None and not df1h.empty:
-        return df1h
+        # status ok: "s": "ok"
+        if not data or data.get("s") != "ok":
+            return None, f"Finnhub no devolvió velas: {data}"
 
-    # fallback 30m
-    df30 = download_intraday_data(ticker, period=period, interval="30m")
-    if df30 is None or df30.empty:
-        return None
+        df = pd.DataFrame({
+            "Open": data["o"],
+            "High": data["h"],
+            "Low": data["l"],
+            "Close": data["c"],
+            "Volume": data["v"],
+        })
 
-    # resample a 1H desde 30m
-    o = df30["Open"].resample("1H").first()
-    h = df30["High"].resample("1H").max()
-    l = df30["Low"].resample("1H").min()
-    c = df30["Close"].resample("1H").last()
-    v = df30["Volume"].resample("1H").sum()
+        # index con timestamps
+        df.index = pd.to_datetime(data["t"], unit="s", utc=True)
 
-    df1 = pd.concat([o, h, l, c, v], axis=1)
-    df1.columns = ["Open", "High", "Low", "Close", "Volume"]
-    df1 = df1.dropna()
+        df = df.dropna()
+        if df.empty:
+            return None, "Finnhub devolvió DF vacío."
 
-    return df1
+        return df, None
+
+    except Exception as e:
+        return None, f"Error Finnhub: {str(e)}"
 
 
 def resample_to_4h(df_1h):
@@ -252,8 +239,10 @@ def trend_4h(df4):
 # ============================================================
 
 def detect_bos_1h(df1, direction):
-    close = float(df1["Close"].iloc[-1])
-    ph, pl = pivots(df1, 3, 3)
+    df = df1.copy()
+    close = float(df["Close"].iloc[-1])
+
+    ph, pl = pivots(df, 3, 3)
 
     if direction == "LONG":
         if not ph:
@@ -314,6 +303,9 @@ def compute_pullback_entry(df1, direction):
 # ============================================================
 
 def build_swing_plan_pro(df1, df4, ticker):
+    df1 = df1.copy()
+    df4 = df4.copy()
+
     current_price = float(df1["Close"].iloc[-1])
     tendencia = trend_4h(df4)
 
@@ -397,19 +389,19 @@ def build_swing_plan_pro(df1, df4, ticker):
 
     plan = {
         "ticker": ticker,
-        "timestamp_utc": now.strftime("%Y-%m-%d %H:%M:%S %Z"),
-        "sesgo_4h": tendencia,
+        "fecha_hora": now.strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "tendencia_4h": tendencia,
         "direccion": direction,
         "confirmacion": confirmacion,
         "nivel_bos": fmt(bos_level) if bos_level else None,
         "precio_actual": fmt(current_price),
-        "entrada_pullback": fmt(entry),
+        "entrada_sugerida": fmt(entry),
         "sl1": fmt(sl1),
         "sl2": fmt(sl2),
         "tp1": fmt(tp1),
         "tp2": fmt(tp2),
-        "rr_aprox_tp1_sl1": round(float(rr), 2),
-        "nota": "Estrategia PRO: tendencia 4H + pullback a EMA20 1H + SL doble + TP por resistencias + RR mínimo."
+        "rr_aprox_tp1": round(float(rr), 2),
+        "nota": "Estrategia PRO: Finnhub 1H + tendencia 4H + pullback EMA20 1H + SL doble + TP por resistencias + RR mínimo."
     }
 
     return plan
@@ -433,11 +425,11 @@ def export_pdf(plan, filename):
         y -= lh
 
     write("📈 Resumen IA SwingTrading PRO (Pullback)", bold=True, size=15)
-    write(f"Generado: {plan['timestamp_utc']}")
+    write(f"Generado: {plan['fecha_hora']}")
     y -= 10
 
     write(f"Ticker: {plan['ticker']}", bold=True)
-    write(f"Sesgo 4H: {plan['sesgo_4h']}")
+    write(f"Tendencia 4H: {plan['tendencia_4h']}")
     write(f"Dirección sugerida: {plan['direccion']}", bold=True)
     write(f"Confirmación: {plan['confirmacion']}")
     if plan["nivel_bos"]:
@@ -446,12 +438,12 @@ def export_pdf(plan, filename):
 
     write("📌 Plan sugerido", bold=True)
     write(f"Precio actual: {plan['precio_actual']}")
-    write(f"Entrada sugerida (pullback): {plan['entrada_pullback']}")
+    write(f"Entrada sugerida: {plan['entrada_sugerida']}")
     write(f"SL1: {plan['sl1']}")
     write(f"SL2: {plan['sl2']}")
     write(f"TP1: {plan['tp1']}")
     write(f"TP2: {plan['tp2']}")
-    write(f"RR aprox (TP1/SL1): {plan['rr_aprox_tp1_sl1']}")
+    write(f"RR aprox (TP1): {plan['rr_aprox_tp1']}")
     y -= 10
 
     write("🧠 Nota", bold=True)
@@ -469,24 +461,24 @@ def export_pdf(plan, filename):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "IA Trading Pullback API running"}
+    return {"status": "ok", "message": "IA Trading Pullback API running (Finnhub)"}    
 
 
 @app.get("/analizar")
-def analizar(ticker: str):
+async def analizar(ticker: str):
     try:
         ticker = ticker.strip().upper()
 
-        df1 = download_1h_data_with_fallback(ticker, period="1mo")
+        df1, err = await finnhub_get_1h_candles(ticker, days_back=30)
         if df1 is None or df1.empty:
             return JSONResponse(
-                {"error": "No se pudieron descargar datos intraday (1H/30m). Yahoo puede estar bloqueando Railway."},
+                {"error": f"No se pudieron descargar velas 1H desde Finnhub. {err}"},
                 status_code=400
             )
 
         df4 = resample_to_4h(df1)
         if df4 is None or df4.empty:
-            return JSONResponse({"error": "No se pudo generar 4H desde intraday."}, status_code=400)
+            return JSONResponse({"error": "No se pudo generar 4H desde 1H."}, status_code=400)
 
         plan = build_swing_plan_pro(df1, df4, ticker)
         return plan
@@ -496,20 +488,20 @@ def analizar(ticker: str):
 
 
 @app.get("/pdf")
-def pdf(ticker: str):
+async def pdf(ticker: str):
     try:
         ticker = ticker.strip().upper()
 
-        df1 = download_1h_data_with_fallback(ticker, period="1mo")
+        df1, err = await finnhub_get_1h_candles(ticker, days_back=30)
         if df1 is None or df1.empty:
             return JSONResponse(
-                {"error": "No se pudieron descargar datos intraday (1H/30m)."},
+                {"error": f"No se pudieron descargar velas 1H desde Finnhub. {err}"},
                 status_code=400
             )
 
         df4 = resample_to_4h(df1)
         if df4 is None or df4.empty:
-            return JSONResponse({"error": "No se pudo generar 4H desde intraday."}, status_code=400)
+            return JSONResponse({"error": "No se pudo generar 4H desde 1H."}, status_code=400)
 
         plan = build_swing_plan_pro(df1, df4, ticker)
 
